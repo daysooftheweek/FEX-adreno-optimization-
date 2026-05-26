@@ -3,10 +3,10 @@ name: steamrt4 build
 on:
   push:
     branches:
-      - main
+      - adreno
   pull_request:
     branches:
-      - main
+      - adreno
 
 env:
   DEBIAN_FRONTEND: noninteractive
