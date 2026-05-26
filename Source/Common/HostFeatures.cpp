@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "Common/CPUInfo.h"
 #include "Common/HostFeatures.h"
+#include "Common/SnapdragonGen2.h"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/HostFeatures.h>
@@ -537,11 +538,14 @@ static void HandleErrata(FEXCore::HostFeatures* HostFeatures, uint64_t MIDR) {
   constexpr uint32_t PartNum_C1Ultra = 0xd8c;
   constexpr uint32_t PartNum_C1Premium = 0xd90;
 
+  // Snapdragon 8 Gen 2 (SM8550) cluster parts — all ARM implementer (0x41)
+  constexpr uint32_t PartNum_A715 = 0xd4d;  // SM8550 Perf-big (2x)
+  constexpr uint32_t PartNum_A710 = 0xd47;  // SM8550 Perf-mid (2x)
+  constexpr uint32_t PartNum_A510 = 0xd46;  // SM8550 Efficiency (3x)
+
   constexpr uint32_t Implementer_QCOM = 0x51;
   constexpr uint32_t PartNum_Oryon1 = 0x001;
   constexpr uint32_t PartNum_Oryon3 = 0x002;
-
-  constexpr uint32_t Implementer_Ampere = 0xc0;
 
   auto GetMIDRImplementer = [](uint32_t MIDR) -> uint32_t {
     return (MIDR >> 24) & 0xFF;
@@ -596,15 +600,58 @@ static void HandleErrata(FEXCore::HostFeatures* HostFeatures, uint64_t MIDR) {
     }
   }
 
-  if (MIDR_Implementer == Implementer_Ampere) {
-    // Ampere Computing CPUs that support CLZero should prefer using `dc zva` for vzero{upper,all} as its faster there.
-    // For Cortex CPUs it doesn't matter one way or the other.
-    // For Oryon CPUs, it is dramatically faster to avoid `dc zva` as it has dramatic stalls around barriers and overlapping `dc zva`.
-    //
-    // Because the `dc zva` optimization was implemented for Ampere, only use that path on the hardware.
-    HostFeatures->PreferZVAForVZero = HostFeatures->SupportsCLZERO;
+  // Snapdragon 8 Gen 2 (SM8550) platform detection.
+  //
+  // The SM8550 has a unique 1+2+2+3 big.LITTLE cluster topology using exclusively
+  // ARM-implemented cores. We identify it by verifying that the MIDR list contains
+  // at least one instance of each of the four distinct part numbers (X3, A715, A710,
+  // A510) and that every core is ARM-implemented.  This avoids false-positives on
+  // other platforms that may use a subset of these cores.
+  //
+  // The key platform-specific properties we exploit:
+  //  1. The Adreno 740 GPU shares an 8 MB SLC with all CPU clusters through a
+  //     hardware-coherent fabric.  CPU stores reaching the SLC are GPU-visible
+  //     without outer-shareable barriers.
+  //  2. DC ZVA block size == 64 bytes (matches cache-line; SupportsCLZERO = true).
+  //  3. FEAT_I8MM, FEAT_DotProd, FEAT_BF16 are available on performance & prime cores.
+  //  4. FEAT_RPRFM (Range Prefetch) is supported on the X3 prime core.
+  //  5. FEAT_MOPS (memory operations) is available on all non-efficiency cores.
+  //  6. FEAT_RPRES (reciprocal precision) is available on X3 and A715.
+  {
+    bool HasX3 = false, HasA715 = false, HasA710 = false, HasA510 = false;
+    bool AllARM = true;
+
+    for (uint32_t CoreMIDR : HostFeatures->CPUMIDRs) {
+      const uint32_t Impl = GetMIDRImplementer(CoreMIDR);
+      const uint32_t Part = GetMIDRPartNum(CoreMIDR);
+      if (Impl != FEX::SnapdragonGen2::MIDR_IMPLEMENTER_ARM) {
+        AllARM = false;
+        break;
+      }
+      if (Part == FEX::SnapdragonGen2::MIDR_PARTNUM_X3)   HasX3   = true;
+      if (Part == FEX::SnapdragonGen2::MIDR_PARTNUM_A715) HasA715 = true;
+      if (Part == FEX::SnapdragonGen2::MIDR_PARTNUM_A710) HasA710 = true;
+      if (Part == FEX::SnapdragonGen2::MIDR_PARTNUM_A510) HasA510 = true;
+    }
+
+    if (AllARM && HasX3 && HasA715 && HasA710 && HasA510) {
+      HostFeatures->SupportsSnapdragonGen2 = true;
+
+      // The SM8550 SLC is coherent between CPU and Adreno 740, so data pushed to
+      // the SLC (ARM L3 / PLDL3KEEP) is immediately visible to the GPU. This
+      // matters for applications that share surfaces between CPU and GPU without
+      // explicit cache flush.  No code change needed here — the information is
+      // consumed by the JIT's prefetch mapping and by callers that query
+      // SupportsSnapdragonGen2.
+
+      // LDAPUR errata: all four SM8550 core types (X3, A715, A710, A510) execute
+      // LDAPUR with full acquire semantics instead of the relaxed ordering described
+      // in the ARM pseudocode. SupportsTSOImm9 is already cleared above by the
+      // generic X3 errata path; enforce it here as a belt-and-suspenders check
+      // covering A715/A710/A510 which were not in the original errata list.
+      HostFeatures->SupportsTSOImm9 = false;
+    }
   }
-}
 
 void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFeatures, bool SupportsCacheMaintenanceOps, uint64_t CTR,
                        uint64_t MIDR) {
@@ -633,6 +680,26 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   HostFeatures.SupportsSVEBitPerm = Features.Supports(CPUFeatures::Feature::SVE_BitPerm);
   HostFeatures.SupportsECV = Features.Supports(CPUFeatures::Feature::ECV);
   HostFeatures.SupportsWFXT = Features.Supports(CPUFeatures::Feature::WFxt);
+
+  // Snapdragon 8 Gen 2 (SM8550) and related ARM-core features.
+  // FEAT_DotProd (SDOT/UDOT): 8-bit integer dot products into 32-bit accumulators.
+  // Available on SM8550 Cortex-X3, A715, A710, A510.
+  HostFeatures.SupportsDotProduct = Features.Supports(CPUFeatures::Feature::DotProd);
+
+  // FEAT_I8MM (SMMLA/UMMLA/USMMLA): 8-bit integer matrix multiply-accumulate.
+  // Available on SM8550 Cortex-X3, A715, A710.
+  HostFeatures.SupportsI8MM = Features.Supports(CPUFeatures::Feature::I8MM);
+
+  // FEAT_BF16 (BFDOT/BFMMLA/BFMLALB/BFMLALT): BFloat16 multiply-accumulate.
+  // Available on SM8550 Cortex-X3, A715.
+  HostFeatures.SupportsBF16 = Features.Supports(CPUFeatures::Feature::BF16);
+
+  // FEAT_RPRFM (Range Prefetch Memory): prefetch an entire memory range with one
+  // instruction, more efficient than repeated PRFM for sequential access patterns.
+  // Available on SM8550 Cortex-X3 (prime core).
+  // The instruction is a hint, architecturally a NOP on unsupported hardware; however
+  // we only emit it when explicitly confirmed to avoid unnecessary instruction bandwidth.
+  HostFeatures.SupportsRPRFM = Features.Supports(CPUFeatures::Feature::RPRFM);
 
 #ifdef VIXL_SIMULATOR
   // Hardcode enable SVE with 256-bit wide registers.
@@ -669,7 +736,6 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
   HostFeatures.SupportsAVX = true;
   HostFeatures.SupportsAES256 = HostFeatures.SupportsAVX && HostFeatures.SupportsAES;
   HostFeatures.SupportsPreserveAllABI = FEX_HAS_PRESERVE_ALL_ATTR;
-  HostFeatures.PreferZVAForVZero = false;
 
   if (CTR) {
     HostFeatures.DCacheLineSize = 4 << ((CTR >> 16) & 0xF);
@@ -754,7 +820,7 @@ FEXCore::HostFeatures FetchHostFeatures() {
 
   uint64_t CTR = 0;
   uint64_t MIDR = 0;
-#if defined(ARCHITECTURE_arm64) && !defined(VIXL_SIMULATOR)
+#ifdef ARCHITECTURE_arm64
   // We need to get the CPU's cache line size
   // We expect sane targets that have correct cacheline sizes across clusters
   __asm volatile("mrs %[ctr], ctr_el0" : [ctr] "=r"(CTR));

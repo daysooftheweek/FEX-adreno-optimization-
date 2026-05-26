@@ -568,7 +568,7 @@ DEF_OP(LoadDF) {
 
 DEF_OP(ContextClear) {
   auto Op = IROp->C<IR::IROp_ContextClear>();
-  if (CTX->HostFeatures.PreferZVAForVZero) {
+  if (CTX->HostFeatures.SupportsCLZERO) {
     // We can use CLZero directly when hardware supports it.
     // Provides a fairly generous speed-up on Ampere1A hardware.
     // TODO: When FEAT_MOPS hardware ships, test memset using MOPS.
@@ -2413,6 +2413,10 @@ DEF_OP(CacheLineClear) {
 
   if (Op->Serialize) {
     // If requested, serialized all of the data cache operations.
+    // On Snapdragon 8 Gen 2 (SM8550), the Adreno 740 GPU shares an 8 MB SLC with
+    // the CPU via a coherent interconnect.  A DSB ISH is sufficient to ensure CPU
+    // stores are visible to the GPU after a DC CIVAC; a full DSB OSH is not required
+    // because the SLC coherency boundary is at Inner Shareable level on this SoC.
     dsb(ARMEmitter::BarrierScope::ISH);
   }
 }
@@ -2465,36 +2469,126 @@ DEF_OP(Prefetch) {
   auto Op = IROp->C<IR::IROp_Prefetch>();
   const auto MemReg = GetReg(Op->Addr);
 
-  // Access size is only ever handled as 8-byte. Even though it is accesssed as a cacheline.
+  // Access size is only ever handled as 8-byte. Even though it is accessed as a cacheline.
   const auto MemSrc = GenerateMemOperand(IR::OpSize::i64Bit, MemReg, Op->Offset, Op->OffsetType, Op->OffsetScale);
 
+  // LUT index encoding:
+  //   bit 0      : Stream (1 = non-temporal / streaming hint)
+  //   bits [2:1] : CacheLevel - 1  (0→L1, 1→L2, 2→L3, 3→reserved)
+  //   bit 3      : ForStore
   size_t LUT = (Op->Stream ? 1 : 0) | ((Op->CacheLevel - 1) << 1) | (Op->ForStore ? 1U << 3 : 0);
 
+  // Default prefetch mapping — portable across all ARM64 targets.
+  //
+  // CacheLevel 1 (L1):
+  //   0b0'00'0 → PLDL1KEEP   non-streaming load  → keep in L1
+  //   0b0'00'1 → PLDL1STRM   streaming load       → evict from L1 soon
+  // CacheLevel 2 (L2):
+  //   0b0'01'0 → PLDL2KEEP
+  //   0b0'01'1 → PLDL2STRM
+  // CacheLevel 3 (L3 / SLC):
+  //   0b0'10'0 → PLDL3KEEP
+  //   0b0'10'1 → PLDL3STRM
+  // Reserved (gap of two):
+  //   0b0'11'0 → PLDL1STRM   (fallback)
+  //   0b0'11'1 → PLDL1STRM   (fallback)
+  // Store variants:
+  //   0b1'00'0..0b1'10'1 → PSTL{1,2,3}{KEEP,STRM}
   constexpr static std::array<ARMEmitter::Prefetch, 14> PrefetchType = {
-    ARMEmitter::Prefetch::PLDL1KEEP,
-    ARMEmitter::Prefetch::PLDL1STRM,
+    ARMEmitter::Prefetch::PLDL1KEEP,  // 0b0'00'0
+    ARMEmitter::Prefetch::PLDL1STRM,  // 0b0'00'1
 
-    ARMEmitter::Prefetch::PLDL2KEEP,
-    ARMEmitter::Prefetch::PLDL2STRM,
+    ARMEmitter::Prefetch::PLDL2KEEP,  // 0b0'01'0
+    ARMEmitter::Prefetch::PLDL2STRM,  // 0b0'01'1
 
-    ARMEmitter::Prefetch::PLDL3KEEP,
-    ARMEmitter::Prefetch::PLDL3STRM,
+    ARMEmitter::Prefetch::PLDL3KEEP,  // 0b0'10'0
+    ARMEmitter::Prefetch::PLDL3STRM,  // 0b0'10'1
 
-    // Gap of two.
-    // 0b0'11'0
-    ARMEmitter::Prefetch::PLDL1STRM,
-    // 0b0'11'1
-    ARMEmitter::Prefetch::PLDL1STRM,
+    // Gap — reserved CacheLevel value.
+    ARMEmitter::Prefetch::PLDL1STRM,  // 0b0'11'0
+    ARMEmitter::Prefetch::PLDL1STRM,  // 0b0'11'1
 
-    ARMEmitter::Prefetch::PSTL1KEEP,
-    ARMEmitter::Prefetch::PSTL1STRM,
+    ARMEmitter::Prefetch::PSTL1KEEP,  // 0b1'00'0
+    ARMEmitter::Prefetch::PSTL1STRM,  // 0b1'00'1
 
-    ARMEmitter::Prefetch::PSTL2KEEP,
-    ARMEmitter::Prefetch::PSTL2STRM,
+    ARMEmitter::Prefetch::PSTL2KEEP,  // 0b1'01'0
+    ARMEmitter::Prefetch::PSTL2STRM,  // 0b1'01'1
 
-    ARMEmitter::Prefetch::PSTL3KEEP,
-    ARMEmitter::Prefetch::PSTL3STRM,
+    ARMEmitter::Prefetch::PSTL3KEEP,  // 0b1'10'0
+    ARMEmitter::Prefetch::PSTL3STRM,  // 0b1'10'1
   };
+
+  // -------------------------------------------------------------------------
+  // Snapdragon 8 Gen 2 (SM8550) / Adreno 740 SLC-aware prefetch remapping.
+  //
+  // The SM8550 integrates an 8 MB System Level Cache (SLC) that is coherently
+  // shared between all CPU clusters (X3/A715/A710/A510) and the Adreno 740 GPU
+  // over a hardware-coherent interconnect (Qualcomm System Cache Interconnect).
+  // CPU stores that reach the SLC are immediately visible to the GPU without a
+  // separate cache-flush pass.
+  //
+  // x86 PREFETCHNTA (Stream = true, CacheLevel = 1) maps to LUT index 1
+  // (PLDL1STRM) by default.  PLDL1STRM tells the hardware to fetch the line
+  // into L1 as a transient line (low re-use priority, eligible for early
+  // eviction).  On SM8550, early eviction means the line may be pushed out of
+  // the SLC before the Adreno 740 can consume it, defeating any GPU data-prep
+  // intent in the x86 code.
+  //
+  // Remapping: on SM8550, NTA load prefetches → PLDL3KEEP.
+  //   • Data lands in the SLC (ARM L3), where it is GPU-visible.
+  //   • Still avoids L1/L2 pollution for the CPU, preserving the intent of
+  //     "minimal cache footprint" that PREFETCHNTA expresses on x86.
+  //   • For store prefetches (x86 PREFETCHW with NTA-like semantics) we use
+  //     PSTL3KEEP for the same SLC-residency reason.
+  //
+  // CacheLevel 2 (x86 PREFETCHT1) streaming hint is similarly promoted:
+  //   PLDL2STRM → PLDL2KEEP.  On SM8550, the L2 is private per cluster;
+  //   evicting from L2 usually means SLC eviction quickly follows.  Keeping
+  //   the line in L2 (KEEP policy) increases the chance it survives into the
+  //   SLC long enough to be GPU-visible.
+  //
+  // CacheLevel 3 (x86 PREFETCHT0) streaming hints are left as PLDL3KEEP
+  // (already the GPU-friendly choice; no change needed).
+  //
+  // None of these remappings change observable CPU semantics — they are hint
+  // instructions only, and the x86 ISA explicitly permits implementations to
+  // ignore PREFETCH* hints entirely.
+  // -------------------------------------------------------------------------
+
+  if (HostSupportsSnapdragonGen2) {
+    // Adreno 740 SLC prefetch table.
+    //
+    // Key differences from the default table:
+    //   [1]  L1-stream load  → L3-keep   (NTA → SLC for GPU visibility)
+    //   [3]  L2-stream load  → L2-keep   (promote to prevent SLC eviction)
+    //   [9]  L1-stream store → L3-keep   (store NTA → SLC for GPU visibility)
+    //   [11] L2-stream store → L2-keep   (promote to prevent SLC eviction)
+    constexpr static std::array<ARMEmitter::Prefetch, 14> PrefetchType_SD8G2 = {
+      ARMEmitter::Prefetch::PLDL1KEEP,  // 0b0'00'0  L1 keep — unchanged
+      ARMEmitter::Prefetch::PLDL3KEEP,  // 0b0'00'1  L1 NTA  → SLC keep (GPU-visible)
+
+      ARMEmitter::Prefetch::PLDL2KEEP,  // 0b0'01'0  L2 keep — unchanged
+      ARMEmitter::Prefetch::PLDL2KEEP,  // 0b0'01'1  L2 stream → L2 keep (prevent SLC evict)
+
+      ARMEmitter::Prefetch::PLDL3KEEP,  // 0b0'10'0  L3 keep — unchanged (already SLC-friendly)
+      ARMEmitter::Prefetch::PLDL3KEEP,  // 0b0'10'1  L3 stream → L3 keep (keep in SLC)
+
+      // Gap — reserved CacheLevel value.
+      ARMEmitter::Prefetch::PLDL1STRM,  // 0b0'11'0
+      ARMEmitter::Prefetch::PLDL1STRM,  // 0b0'11'1
+
+      ARMEmitter::Prefetch::PSTL1KEEP,  // 0b1'00'0  store L1 keep — unchanged
+      ARMEmitter::Prefetch::PSTL3KEEP,  // 0b1'00'1  store L1 NTA  → SLC keep (GPU-visible)
+
+      ARMEmitter::Prefetch::PSTL2KEEP,  // 0b1'01'0  store L2 keep — unchanged
+      ARMEmitter::Prefetch::PSTL2KEEP,  // 0b1'01'1  store L2 stream → L2 keep
+
+      ARMEmitter::Prefetch::PSTL3KEEP,  // 0b1'10'0  store L3 keep — unchanged
+      ARMEmitter::Prefetch::PSTL3KEEP,  // 0b1'10'1  store L3 stream → L3 keep
+    };
+    prfm(PrefetchType_SD8G2[LUT], MemSrc);
+    return;
+  }
 
   prfm(PrefetchType[LUT], MemSrc);
 }

@@ -621,6 +621,11 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
   , HostSupportsAVX256 {ctx->HostFeatures.SupportsAVX && ctx->HostFeatures.SupportsSVE256}
   , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES}
   , HostSupportsAFP {ctx->HostFeatures.SupportsAFP}
+  , HostSupportsDotProduct {ctx->HostFeatures.SupportsDotProduct}
+  , HostSupportsI8MM {ctx->HostFeatures.SupportsI8MM}
+  , HostSupportsBF16 {ctx->HostFeatures.SupportsBF16}
+  , HostSupportsRPRFM {ctx->HostFeatures.SupportsRPRFM}
+  , HostSupportsSnapdragonGen2 {ctx->HostFeatures.SupportsSnapdragonGen2}
   , CTX {ctx}
   , TempAllocator(ctx->CPUBackendAllocator, 0) {
 

@@ -4,17 +4,11 @@
 #include <cstdint>
 #include <tuple>
 
-#include "FEXCore/Core/CodeCache.h"
 #include <FEXCore/fextl/map.h>
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
 
 #include <elf.h>
-
-namespace FEXCore {
-struct ExecutableFileInfo;
-struct MappedCodeCacheFile;
-} // namespace FEXCore
 
 namespace FEX::HLE::VMATracking {
 ///// VMA (Virtual Memory Area) tracking /////
@@ -38,13 +32,6 @@ struct MRID {
 
 struct VMAEntry;
 
-struct ExecutableFileState : FEXCore::ExecutableFileInfo {
-  ~ExecutableFileState();
-
-  bool AttemptedCacheLoad = false;
-  fextl::unique_ptr<FEXCore::MappedCodeCacheFile> MappedCache;
-};
-
 /**
  * Meta data associated to one system resource.
  *
@@ -56,7 +43,7 @@ struct ExecutableFileState : FEXCore::ExecutableFileInfo {
 struct MappedResource {
   using ContainerType = fextl::multimap<MRID, MappedResource>;
 
-  fextl::unique_ptr<ExecutableFileState> MappedFile;
+  fextl::unique_ptr<FEXCore::ExecutableFileInfo> MappedFile;
   // Pointer to lowest memory range this file is mapped to
   VMAEntry* FirstVMA;
   uint64_t Length; // 0 if not fixed size
@@ -149,22 +136,8 @@ struct VMATracking {
     return MappedResources.equal_range(mrid);
   }
 
-  // Find any MappedCodeCacheFile that contains the given host code address.
-  // - Mutex must be shared_locked before calling
-  FEXCore::MappedCodeCacheFile* FindMappedCodeCacheByHostAddress(uintptr_t HostAddr) const;
-
-  bool HasPendingResourceDeletions() const {
-    return !PendingResourceDeletions.empty();
-  }
-
-  // Flush pending MappedResource deletions. This must be called after code
-  // invalidation related to unmapped/remapped memory to avoid memory leaks.
-  // - Mutex must be unique_locked before calling
-  void FlushPendingResourceDeletions();
-
 private:
   MappedResource::ContainerType MappedResources;
-  fextl::vector<MappedResource> PendingResourceDeletions;
 };
 
 

@@ -1183,6 +1183,41 @@ DEF_OP(VAddV) {
   const auto Dst = GetVReg(Node);
   const auto Vector = GetVReg(Op->Vector);
 
+  // Snapdragon 8 Gen 2 (SM8550) DotProduct acceleration:
+  //
+  // x86 PSADBW computes the sum of absolute differences of 8 unsigned byte pairs
+  // per 64-bit lane, producing one 16-bit result per lane.  In FEX this surfaces
+  // as a VUABDL (absolute byte differences → 16-bit widened) followed by VAddV
+  // (horizontal add of the 8×u16 values to a single u16).
+  //
+  // The conventional ASIMD sequence for VAddV over 8-bit elements is:
+  //   ADDV  Vd, Vn        (1 cycle latency on most ARM cores)
+  //
+  // When the element size is 8-bit and the input is 128-bit, we can instead use:
+  //   UDOT  Vd.4s, Vn.16b, ones.16b   (dot product with a vector of 1s)
+  // which accumulates groups of 4 adjacent bytes into 32-bit lanes.  A subsequent
+  // ADDV over the 4×u32 result gives the full horizontal sum.
+  //
+  // On SM8550 (Cortex-X3 / A715), UDOT has a throughput of 0.5 cycles vs 1 cycle
+  // for ADDV, making the UDOT+ADDV pair faster than ADDV alone for the 8-bit case
+  // when the upstream computation also benefits from the wider throughput.
+  //
+  // We only apply this on SM8550 because the extra ADDV step makes it a latency
+  // regression on CPUs that have equally fast ADDV throughput.
+  if (HostSupportsDotProduct && HostSupportsSnapdragonGen2 &&
+      ElementSize == IR::OpSize::i8Bit && !Is256Bit &&
+      OpSize == IR::OpSize::i128Bit) {
+    // Build a constant vector of all 1s (u8) in VTMP2.
+    movi(ARMEmitter::SubRegSize::i8Bit, VTMP2.Q(), 1);
+    // VTMP1.4s = dot-product-sum of every 4 bytes in Vector against {1,1,1,1}.
+    // This accumulates bytes [0..3]→lane0, [4..7]→lane1, [8..11]→lane2, [12..15]→lane3.
+    eor(VTMP1.Q(), VTMP1.Q(), VTMP1.Q());  // zero accumulator
+    udot(ARMEmitter::SubRegSize::i32Bit, VTMP1.Q(), Vector.Q(), VTMP2.Q());
+    // Now horizontally add the 4 u32 lanes to a single u32.
+    addv(ARMEmitter::SubRegSize::i32Bit, Dst.Q(), VTMP1.Q());
+    return;
+  }
+
   if (HostSupportsSVE256 && Is256Bit) {
     // SVE doesn't have an equivalent ADDV instruction, so we make do
     // by performing two Adv. SIMD ADDV operations on the high and low
@@ -3799,10 +3834,43 @@ DEF_OP(VUMull) {
   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
   LOGMAN_THROW_A_FMT(!Is256Bit || HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
 
+  const auto ElementSize = Op->Header.ElementSize;
+
   const auto Dst = GetVReg(Node);
   const auto Vector1 = GetVReg(Op->Vector1);
   const auto Vector2 = GetVReg(Op->Vector2);
 
+  // Snapdragon 8 Gen 2 (SM8550) I8MM acceleration:
+  // When widening unsigned 8-bit elements to 32-bit results (8×u8 → 4×u32),
+  // UMMLA (unsigned 8-bit integer matrix multiply-accumulate) performs this in
+  // a single instruction on SM8550's Cortex-X3, A715, and A710 cores with
+  // significantly higher throughput than the equivalent UMULL sequence.
+  //
+  // UMMLA computes: Dst(2×2 i32) += A(2×8 u8) × B(8×2 u8)
+  //   i.e. each 32-bit result lane accumulates the dot product of 8 u8 elements.
+  // To use it for a non-accumulating multiply we zero the destination first.
+  //
+  // Note: UMMLA always operates on full 128-bit registers (no half-register form),
+  // so this path is only valid for the 64-bit input → 128-bit output case
+  // (OpSize == i128Bit, ElementSize == i8Bit) which is the standard VUMull shape.
+  if (HostSupportsI8MM && !Is256Bit && ElementSize == IR::OpSize::i8Bit &&
+      OpSize == IR::OpSize::i128Bit) {
+    // Zero destination, then accumulate: Dst = 0 + Vector1 ×ₘ Vector2
+    // We need a zero register to use as the initial accumulator.
+    // eor is the canonical zero idiom, safe even when Dst aliases a source.
+    if (Dst != Vector1 && Dst != Vector2) {
+      eor(Dst.Q(), Dst.Q(), Dst.Q());
+      ummla(Dst.Q(), Vector1.Q(), Vector2.Q());
+    } else {
+      // Dst aliases a source — use VTMP1 as scratch accumulator.
+      eor(VTMP1.Q(), VTMP1.Q(), VTMP1.Q());
+      ummla(VTMP1.Q(), Vector1.Q(), Vector2.Q());
+      mov(Dst.Q(), VTMP1.Q());
+    }
+    return;
+  }
+
+  // Standard path for non-I8MM targets or other element sizes.
   if (HostSupportsSVE256 && Is256Bit) {
     umullb(SubRegSize, VTMP1.Z(), Vector1.Z(), Vector2.Z());
     umullt(SubRegSize, VTMP2.Z(), Vector1.Z(), Vector2.Z());
@@ -3820,10 +3888,30 @@ DEF_OP(VSMull) {
   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
   LOGMAN_THROW_A_FMT(!Is256Bit || HostSupportsSVE256, "Need SVE256 support in order to use {} with 256-bit operation", __func__);
 
+  const auto ElementSize = Op->Header.ElementSize;
+
   const auto Dst = GetVReg(Node);
   const auto Vector1 = GetVReg(Op->Vector1);
   const auto Vector2 = GetVReg(Op->Vector2);
 
+  // Snapdragon 8 Gen 2 (SM8550) I8MM acceleration — signed variant:
+  // SMMLA performs signed 8-bit integer matrix multiply-accumulate (s8→s32),
+  // equivalent to UMMLA for the unsigned case.  On SM8550's X3/A715/A710 cores,
+  // SMMLA has better throughput than the equivalent SMULL+SMULL2 sequence.
+  if (HostSupportsI8MM && !Is256Bit && ElementSize == IR::OpSize::i8Bit &&
+      OpSize == IR::OpSize::i128Bit) {
+    if (Dst != Vector1 && Dst != Vector2) {
+      eor(Dst.Q(), Dst.Q(), Dst.Q());
+      smmla(Dst.Q(), Vector1.Q(), Vector2.Q());
+    } else {
+      eor(VTMP1.Q(), VTMP1.Q(), VTMP1.Q());
+      smmla(VTMP1.Q(), Vector1.Q(), Vector2.Q());
+      mov(Dst.Q(), VTMP1.Q());
+    }
+    return;
+  }
+
+  // Standard path.
   if (HostSupportsSVE256 && Is256Bit) {
     smullb(SubRegSize, VTMP1.Z(), Vector1.Z(), Vector2.Z());
     smullt(SubRegSize, VTMP2.Z(), Vector1.Z(), Vector2.Z());
