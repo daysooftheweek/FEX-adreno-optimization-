@@ -23,13 +23,6 @@
           "Enable the code caching subsystem"
         ]
       },
-      "EnableLazyCodeCachingWIP": {
-        "Type": "bool",
-        "Default": "false",
-        "Desc": [
-          "Enable lazy loading of chunks in code caches"
-        ]
-      },
       "EnableCodeCacheValidation": {
         "Type": "bool",
         "Default": "false",

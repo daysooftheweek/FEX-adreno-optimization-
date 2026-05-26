@@ -3,10 +3,10 @@ name: Mingw build
 on:
   push:
     branches:
-      - main
+      - adreno
   pull_request:
     branches:
-      - main
+      - adreno
 
 env:
   BUILD_TYPE: Debug

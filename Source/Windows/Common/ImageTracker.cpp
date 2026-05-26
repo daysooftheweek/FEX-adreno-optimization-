@@ -172,7 +172,7 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
 
     auto AOTImage = AOTImages.find(ID);
     if (AOTImage != AOTImages.end()) {
-      // TODO: CodeCache::EnableLoadedSection
+      CTX.GetCodeCache().LoadData(nullptr, AOTImage->second.Data, ImageInfo->SectionInfo);
     }
   }
 
@@ -280,7 +280,6 @@ void ImageTracker::LoadAOTImages(MappedImageInfo& ImageInfo) {
               RtlUnicodeToMultiByteN(UniqueId.data(), AnsiLength, NULL, Info->FileName, Info->FileNameLength);
 
               AOTImages[UniqueId] = {.Data = static_cast<std::byte*>(LoadAddress)};
-              // TODO: CodeCache::LoadCache, CodeCache::RegisterMappedCodeBuffer
               LogMan::Msg::IFmt("Loaded cache: {}", UniqueId);
             }
           }
