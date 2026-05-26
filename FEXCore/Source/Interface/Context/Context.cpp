@@ -53,6 +53,6 @@ FEXCore::CPUID::FunctionResults FEXCore::Context::ContextImpl::RunCPUIDFunctionN
 }
 
 bool FEXCore::Context::ContextImpl::IsAddressInCodeBuffer(FEXCore::Core::InternalThreadState* Thread, uintptr_t Address) const {
-  return Thread->CPUBackend->IsAddressInCodeBuffer(Address) || CodeCache.IsAddressInMappedCodeBuffer(Address);
+  return Thread->CPUBackend->IsAddressInCodeBuffer(Address);
 }
 } // namespace FEXCore::Context

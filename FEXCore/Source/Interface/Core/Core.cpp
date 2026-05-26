@@ -466,6 +466,7 @@ void ContextImpl::UnlockAfterFork(FEXCore::Core::InternalThreadState* LiveThread
     if (Config.StrictInProcessSplitLocks) {
       FEXCore::Utils::SpinWaitLock::unlock(&StrictSplitLockMutex);
     }
+    return;
   }
 }
 

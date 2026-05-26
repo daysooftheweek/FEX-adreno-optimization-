@@ -67,6 +67,29 @@ private:
   const bool HostSupportsRPRES {};
   const bool HostSupportsAFP {};
 
+  // Snapdragon 8 Gen 2 (SM8550) / Adreno 740 specific JIT flags.
+  // These are derived from HostFeatures at construction time and cached here to
+  // avoid repeated pointer-chasing through CTX during hot JIT codegen paths.
+
+  // FEAT_DotProd: enables SDOT/UDOT emission for 8-bit horizontal dot products.
+  const bool HostSupportsDotProduct {};
+
+  // FEAT_I8MM: enables SMMLA/UMMLA/USMMLA emission for 8-bit matrix multiply.
+  const bool HostSupportsI8MM {};
+
+  // FEAT_BF16: enables BFDOT/BFMMLA/BFMLALB/BFMLALT for BFloat16 accumulation.
+  const bool HostSupportsBF16 {};
+
+  // FEAT_RPRFM: enables rprfm emission for range-based prefetch hints.
+  // On SM8550, the X3 prime core supports this; other cores silently NOP it.
+  const bool HostSupportsRPRFM {};
+
+  // SM8550 platform flag: Adreno 740 GPU shares an 8 MB SLC coherently with the CPU.
+  // When set, the JIT remaps certain x86 prefetch semantics to target the SLC
+  // (ARM L3) rather than streaming to L1, so that CPU-written data is immediately
+  // warm for the GPU without an additional cache-flush pass.
+  const bool HostSupportsSnapdragonGen2 {};
+
   struct RestartOptions {
     enum class Control : uint64_t {
       Incoming = 0,

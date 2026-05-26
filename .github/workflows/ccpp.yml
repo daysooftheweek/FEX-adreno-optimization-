@@ -3,10 +3,10 @@ name: Build + Test
 on:
   push:
     branches:
-      - main
+      - adreno
   pull_request:
     branches:
-      - main
+      - adreno
 
 env:
   # Customize the CMake build type here (Release, Debug, RelWithDebInfo, etc.)

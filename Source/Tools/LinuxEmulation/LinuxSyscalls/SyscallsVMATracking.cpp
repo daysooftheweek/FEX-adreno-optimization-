@@ -7,20 +7,10 @@ desc: VMA Tracking
 $end_info$
 */
 
-#include "FEXCore/Utils/MathUtils.h"
 #include "LinuxSyscalls/Syscalls.h"
 #include <sys/shm.h>
 
 namespace FEX::HLE::VMATracking {
-
-ExecutableFileState::~ExecutableFileState() {
-  if (MappedCache && MappedCache->MappedFile.data()) {
-    auto ret = FEXCore::Allocator::munmap(MappedCache->MappedFile.data(),
-                                          FEXCore::AlignUp(MappedCache->MappedFile.size_bytes(), FEXCore::Utils::FEX_PAGE_SIZE));
-    LOGMAN_THROW_A_FMT(ret == 0, "Error unmapping cache for {}: {} {}", Filename, errno, strerror(errno));
-  }
-}
-
 /// Helpers ///
 auto VMAProt::fromProt(int Prot) -> VMAProt {
   return VMAProt {
@@ -245,13 +235,7 @@ void VMATracking::DeleteVMARange(FEXCore::Context::Context* CTX, uintptr_t Base,
         // If linked to a Mapped Resource, remove from linked list and possibly delete the Mapped Resource
         if (Current->Resource) {
           if (ListRemove(Current) && Current->Resource != PreservedMappedResource) {
-            auto Iter = Current->Resource->Iterator;
-            // Defer deletion if the resource has mapped code cache data, so its code buffer
-            // outlives code cache invalidation (which runs after the VMA lock is released).
-            if (Current->Resource->MappedFile && Current->Resource->MappedFile->MappedCache) {
-              PendingResourceDeletions.push_back(std::move(*Current->Resource));
-            }
-            MappedResources.erase(Iter);
+            MappedResources.erase(Current->Resource->Iterator);
           }
         }
 
@@ -291,11 +275,6 @@ void VMATracking::DeleteVMARange(FEXCore::Context::Context* CTX, uintptr_t Base,
       }
     }
   }
-}
-
-void VMATracking::FlushPendingResourceDeletions() {
-  Mutex.check_lock_owned_by_self_as_write();
-  PendingResourceDeletions.clear();
 }
 
 // Change flags of mappings in a range and split the mappings if needed
@@ -563,11 +542,7 @@ uintptr_t VMATracking::DeleteSHMRegion(FEXCore::Context::Context* CTX, uintptr_t
   do {
     if (Entry->second.Resource == Resource) {
       if (ListRemove(&Entry->second)) {
-        auto Iter = Entry->second.Resource->Iterator;
-        if (Entry->second.Resource->MappedFile && Entry->second.Resource->MappedFile->MappedCache) {
-          PendingResourceDeletions.push_back(std::move(*Entry->second.Resource));
-        }
-        MappedResources.erase(Iter);
+        MappedResources.erase(Entry->second.Resource->Iterator);
       }
       Entry = VMAs.erase(Entry);
     } else {
@@ -577,18 +552,4 @@ uintptr_t VMATracking::DeleteSHMRegion(FEXCore::Context::Context* CTX, uintptr_t
 
   return ShmLength;
 }
-
-FEXCore::MappedCodeCacheFile* VMATracking::FindMappedCodeCacheByHostAddress(uintptr_t HostAddr) const {
-  for (auto& [_, Resource] : MappedResources) {
-    if (Resource.MappedFile && Resource.MappedFile->MappedCache) {
-      auto* Code = Resource.MappedFile->MappedCache.get();
-      auto BufferStart = reinterpret_cast<uintptr_t>(Code->CodeBuffer.data());
-      if (HostAddr >= BufferStart && HostAddr < BufferStart + Code->CodeBuffer.size_bytes()) {
-        return Code;
-      }
-    }
-  }
-  return nullptr;
-}
-
 } // namespace FEX::HLE::VMATracking
